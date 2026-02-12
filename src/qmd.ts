@@ -60,12 +60,13 @@ import {
   type ExpandedQuery,
   DEFAULT_EMBED_MODEL,
   DEFAULT_RERANK_MODEL,
+  getActiveEmbedModel,
   DEFAULT_GLOB,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import { disposeDefaultLlamaCpp, withLLMSession, useOpenAI, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -1482,7 +1483,7 @@ function renderProgressBar(percent: number, width: number = 30): string {
   return bar;
 }
 
-async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false): Promise<void> {
+async function vectorIndex(model: string = getActiveEmbedModel(), force: boolean = false): Promise<void> {
   const db = getDb();
   const now = new Date().toISOString();
 
@@ -1490,6 +1491,24 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
     clearAllEmbeddings(db);
+  }
+
+  // Detect embedding model change (e.g. embeddinggemma → openai/text-embedding-3-small)
+  if (!force) {
+    const tableExists = db.prepare(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name='content_vectors'`
+    ).get();
+    if (tableExists) {
+      const existingModel = db.prepare(
+        `SELECT DISTINCT model FROM content_vectors LIMIT 1`
+      ).get() as { model: string } | undefined;
+
+      if (existingModel && existingModel.model !== model) {
+        console.log(`${c.yellow}Embedding model changed: ${existingModel.model} → ${model}${c.reset}`);
+        console.log(`${c.yellow}Clearing old embeddings for re-indexing...${c.reset}`);
+        clearAllEmbeddings(db);
+      }
+    }
   }
 
   // Find unique hashes that need embedding (from active documents)
@@ -1561,7 +1580,11 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     if (!firstChunk) {
       throw new Error("No chunks available to embed");
     }
-    const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
+    const isOpenAI = useOpenAI();
+    const formatText = (text: string, title: string) =>
+      isOpenAI ? (title ? `${title}\n\n${text}` : text) : formatDocForEmbedding(text, title);
+
+    const firstText = formatText(firstChunk.text, firstChunk.title);
     const firstResult = await session.embed(firstText);
     if (!firstResult) {
       throw new Error("Failed to get embedding dimensions from first chunk");
@@ -1580,7 +1603,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       const batch = allChunks.slice(batchStart, batchEnd);
 
       // Format texts for embedding
-      const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+      const texts = batch.map(chunk => formatText(chunk.text, chunk.title));
 
       try {
         // Batch embed all texts at once
@@ -1604,7 +1627,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
         // If batch fails, try individual embeddings as fallback
         for (const chunk of batch) {
           try {
-            const text = formatDocForEmbedding(chunk.text, chunk.title);
+            const text = formatText(chunk.text, chunk.title);
             const result = await session.embed(text);
             if (result) {
               insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
@@ -1647,9 +1670,11 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     if (errors > 0) {
       console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
     }
-  }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
 
-  closeDb();
+    closeDb();
+    // Exit before withLLMSession finally block triggers GC → Bun NAPI crash
+    process.reallyExit(0);
+  }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
 }
 
 // Sanitize a term for FTS5: remove punctuation except apostrophes
@@ -1953,6 +1978,9 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       context: r.context,
       docid: r.docid,
     })), query, { ...opts, limit: results.length });
+
+    // Exit before withLLMSession finally block triggers GC → Bun NAPI crash
+    process.reallyExit(0);
   }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
 }
 
@@ -2011,7 +2039,175 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       context: r.context,
       docid: r.docid,
     })), query, { ...opts, limit: results.length });
+
+    // Exit before withLLMSession finally block triggers GC → Bun NAPI crash
+    process.reallyExit(0);
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
+}
+
+async function askQuestion(question: string, opts: OutputOptions): Promise<void> {
+  const store = getStore();
+
+  if (opts.collection) {
+    const coll = getCollectionFromYaml(opts.collection);
+    if (!coll) {
+      console.error(`Collection not found: ${opts.collection}`);
+      closeDb();
+      process.exit(1);
+    }
+  }
+
+  checkIndexHealth(store.db);
+
+  const { OpenAISession } = await import("./openai.js");
+  const oai = new OpenAISession(process.env.OPENAI_API_KEY!);
+
+  const MAX_TURNS = 6;
+  const allSources: { file: string; docid: string; score: number }[] = [];
+
+  // Tool to execute a hybrid search
+  async function executeSearch(query: string): Promise<string> {
+    process.stderr.write(`${c.dim}  Searching: "${query}"${c.reset}\n`);
+
+    const results = await withLLMSession(async () => {
+      return await hybridQuery(store, query, {
+        collection: opts.collection,
+        limit: opts.limit || 20,
+        minScore: opts.minScore || 0,
+        hooks: {
+          onExpand: (_original, expanded) => {
+            process.stderr.write(`${c.dim}  ├─ ${expanded.length + 1} expanded queries${c.reset}\n`);
+          },
+          onRerankStart: (chunkCount) => {
+            process.stderr.write(`${c.dim}  └─ Reranking ${chunkCount} chunks...${c.reset}\n`);
+          },
+          onRerankDone: () => {},
+        },
+      });
+    }, { maxDuration: 5 * 60 * 1000, name: 'ask-search' });
+
+    if (results.length === 0) return "No results found for this query.";
+
+    // Track sources
+    for (const r of results) {
+      if (!allSources.find(s => s.docid === r.docid)) {
+        allSources.push({ file: r.displayPath, docid: r.docid, score: r.score });
+      }
+    }
+
+    return results.map((r, i) =>
+      `[${i + 1}] ${r.displayPath} (${(r.score * 100).toFixed(0)}%)\n${r.bestChunk}`
+    ).join("\n\n");
+  }
+
+  // Agent loop
+  const tools = [
+    {
+      type: "function" as const,
+      function: {
+        name: "search",
+        description: "Search the document collection with a query. Use different keywords to find different results. You can call this multiple times with different queries.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "The search query" },
+          },
+          required: ["query"],
+        },
+      },
+    },
+    {
+      type: "function" as const,
+      function: {
+        name: "submit_answer",
+        description: "Submit your final answer to the user's question. Only call this when you have enough information, or if you've exhausted your search options.",
+        parameters: {
+          type: "object",
+          properties: {
+            answer: { type: "string", description: "The complete answer to the user's question, with specific details from the documents." },
+          },
+          required: ["answer"],
+        },
+      },
+    },
+  ];
+
+  const messages: any[] = [
+    {
+      role: "system",
+      content: `You are a research assistant that answers questions by searching a document collection of chat logs and conversations organized by date.
+
+You have access to a search tool. Use it to find relevant information before answering.
+
+SEARCHING STRATEGY:
+- The documents are chat logs — people use informal language, not formal keywords
+- Always do at least 2-3 searches with DIFFERENT phrasings before answering
+- Think about how people actually talk about the topic in casual messages
+- For addresses: try "deliver to", "delivery address", "home", "ship to", location names, zip codes
+- For preferences: try the specific item names, brand names, "usual", "regular order"
+- For temporal questions ("current", "latest"): search broadly first, then look at the DATES in results to find the most recent
+- If first search results don't clearly answer the question, search with completely different terms — synonyms, related concepts, how someone would casually mention it in chat
+- Try both specific and broad queries
+
+ANSWERING:
+- When the question asks about "current" or "latest", always prefer the result with the most recent date
+- Cite specific dates and sources
+- If you truly can't find the answer after 3+ searches, say so honestly
+- Call submit_answer only when you have enough information OR have exhausted your search options`,
+    },
+    { role: "user", content: question },
+  ];
+
+  process.stderr.write(`${c.bold}Researching...${c.reset}\n`);
+
+  for (let turn = 0; turn < MAX_TURNS; turn++) {
+    const response = await oai.chatWithTools(messages, tools);
+
+    if (response.finish_reason === "stop" || !response.tool_calls?.length) {
+      // Model responded with text directly (shouldn't happen with tools, but handle it)
+      if (response.content) {
+        console.log(response.content);
+      }
+      break;
+    }
+
+    // Add assistant message with tool calls
+    messages.push({
+      role: "assistant",
+      content: response.content || null,
+      tool_calls: response.tool_calls,
+    });
+
+    // Process each tool call
+    for (const toolCall of response.tool_calls) {
+      const args = JSON.parse(toolCall.function.arguments);
+
+      if (toolCall.function.name === "search") {
+        const result = await executeSearch(args.query);
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: result,
+        });
+      } else if (toolCall.function.name === "submit_answer") {
+        console.log(args.answer);
+
+        // Show sources
+        if (allSources.length > 0) {
+          process.stderr.write(`\n${c.dim}Sources:${c.reset}\n`);
+          for (const s of allSources.slice(0, 8)) {
+            process.stderr.write(`${c.dim}  ${s.file} ${s.docid} (${(s.score * 100).toFixed(0)}%)${c.reset}\n`);
+          }
+        }
+
+        closeDb();
+        process.reallyExit(0);
+      }
+    }
+  }
+
+  closeDb();
+  process.reallyExit(0);
 }
 
 // Parse CLI arguments using util.parseArgs
@@ -2121,6 +2317,7 @@ function showHelp(): void {
   console.log("  qmd search <query>            - Full-text search (BM25)");
   console.log("  qmd vsearch <query>           - Vector similarity search");
   console.log("  qmd query <query>             - Combined search with query expansion + reranking");
+  console.log("  qmd ask <question>            - Answer a question using agentic search (RAG)");
   console.log("  qmd mcp                       - Start MCP server (stdio transport)");
   console.log("  qmd mcp --http [--port N]     - Start MCP server (HTTP transport, default port 8181)");
   console.log("  qmd mcp --http --daemon       - Start MCP server as background daemon");
@@ -2333,8 +2530,8 @@ if (import.meta.main) {
       break;
 
     case "embed":
-      await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force);
-      break;
+      await vectorIndex(getActiveEmbedModel(), !!cli.values.force);
+      process.reallyExit(0); // Skip NAPI finalizers that crash Bun
 
     case "pull": {
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
@@ -2374,7 +2571,7 @@ if (import.meta.main) {
         cli.opts.minScore = 0.3;
       }
       await vectorSearch(cli.query, cli.opts);
-      break;
+      process.reallyExit(0); // Skip NAPI finalizers that crash Bun
 
     case "query":
       if (!cli.query) {
@@ -2382,7 +2579,15 @@ if (import.meta.main) {
         process.exit(1);
       }
       await querySearch(cli.query, cli.opts);
-      break;
+      process.reallyExit(0); // Skip NAPI finalizers that crash Bun
+
+    case "ask":
+      if (!cli.query) {
+        console.error("Usage: qmd ask [options] <question>");
+        process.exit(1);
+      }
+      await askQuestion(cli.query, cli.opts);
+      process.reallyExit(0); // Skip NAPI finalizers that crash Bun
 
     case "mcp": {
       const sub = cli.args[0]; // stop | status | undefined
@@ -2503,8 +2708,8 @@ if (import.meta.main) {
   }
 
   if (cli.command !== "mcp") {
-    await disposeDefaultLlamaCpp();
-    process.exit(0);
+    // Skip NAPI finalizers that crash Bun (sqlite-vec / node-llama-cpp)
+    process.reallyExit(0);
   }
 
 } // end if (import.meta.main)

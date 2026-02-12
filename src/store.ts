@@ -20,6 +20,7 @@ import {
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
+  useOpenAI,
   type RerankDocument,
   type ILLMSession,
 } from "./llm";
@@ -44,6 +45,14 @@ import {
 
 const HOME = Bun.env.HOME || "/tmp";
 export const DEFAULT_EMBED_MODEL = "embeddinggemma";
+
+/** Get the active embed model name based on provider (OpenAI vs local) */
+export function getActiveEmbedModel(): string {
+  if (useOpenAI()) {
+    return `openai/${process.env.OPENAI_EMBED_MODEL || "text-embedding-3-large"}`;
+  }
+  return DEFAULT_EMBED_MODEL;
+}
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
 export const DEFAULT_GLOB = "**/*.md";
@@ -1270,6 +1279,11 @@ export async function chunkDocumentByTokens(
   maxTokens: number = CHUNK_SIZE_TOKENS,
   overlapTokens: number = CHUNK_OVERLAP_TOKENS
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
+  // When using OpenAI, use character-based chunking (~4 chars/token) to avoid loading node-llama-cpp
+  if (useOpenAI()) {
+    return chunkByChars(content, maxTokens * 4, overlapTokens * 4);
+  }
+
   const llm = getDefaultLlamaCpp();
 
   // Tokenize once upfront
@@ -1332,6 +1346,69 @@ export async function chunkDocumentByTokens(
 
     // Advance by step tokens (maxTokens - overlap)
     tokenPos += step;
+  }
+
+  return chunks;
+}
+
+/**
+ * Character-based chunking with sentence boundary detection.
+ * Used when OpenAI is the embedding provider (avoids loading node-llama-cpp tokenizer).
+ */
+function chunkByChars(
+  content: string,
+  maxChars: number = CHUNK_SIZE_CHARS,
+  overlapChars: number = CHUNK_OVERLAP_CHARS
+): { text: string; pos: number; tokens: number }[] {
+  if (content.length <= maxChars) {
+    return [{ text: content, pos: 0, tokens: Math.ceil(content.length / 4) }];
+  }
+
+  const chunks: { text: string; pos: number; tokens: number }[] = [];
+  const step = maxChars - overlapChars;
+  let charPos = 0;
+
+  while (charPos < content.length) {
+    const chunkEnd = Math.min(charPos + maxChars, content.length);
+    let chunkText = content.slice(charPos, chunkEnd);
+
+    // Find a good break point if not at end of document
+    if (chunkEnd < content.length) {
+      const searchStart = Math.floor(chunkText.length * 0.7);
+      const searchSlice = chunkText.slice(searchStart);
+
+      let breakOffset = -1;
+      const paragraphBreak = searchSlice.lastIndexOf('\n\n');
+      if (paragraphBreak >= 0) {
+        breakOffset = paragraphBreak + 2;
+      } else {
+        const sentenceEnd = Math.max(
+          searchSlice.lastIndexOf('. '),
+          searchSlice.lastIndexOf('.\n'),
+          searchSlice.lastIndexOf('? '),
+          searchSlice.lastIndexOf('?\n'),
+          searchSlice.lastIndexOf('! '),
+          searchSlice.lastIndexOf('!\n')
+        );
+        if (sentenceEnd >= 0) {
+          breakOffset = sentenceEnd + 2;
+        } else {
+          const lineBreak = searchSlice.lastIndexOf('\n');
+          if (lineBreak >= 0) {
+            breakOffset = lineBreak + 1;
+          }
+        }
+      }
+
+      if (breakOffset >= 0) {
+        chunkText = chunkText.slice(0, searchStart + breakOffset);
+      }
+    }
+
+    chunks.push({ text: chunkText, pos: charPos, tokens: Math.ceil(chunkText.length / 4) });
+
+    if (chunkEnd >= content.length) break;
+    charPos += step;
   }
 
   return chunks;
@@ -2015,11 +2092,22 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // =============================================================================
 
 async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
-  // Format text using the appropriate prompt template
-  const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
-  const result = session
-    ? await session.embed(formattedText, { model, isQuery })
-    : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
+  const isOAI = useOpenAI();
+  const formattedText = isOAI
+    ? text
+    : (isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text));
+
+  let result;
+  if (session) {
+    result = await session.embed(formattedText, { model, isQuery });
+  } else if (isOAI) {
+    // Create ad-hoc OpenAI session to avoid loading node-llama-cpp
+    const { OpenAISession } = await import("./openai.js");
+    const oai = new OpenAISession(process.env.OPENAI_API_KEY!);
+    result = await oai.embed(formattedText, { model, isQuery });
+  } else {
+    result = await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
+  }
   return result?.embedding || null;
 }
 
@@ -2084,9 +2172,15 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
-  const results = await llm.expandQuery(query);
+  let results;
+  if (useOpenAI()) {
+    const { OpenAISession } = await import("./openai.js");
+    const oai = new OpenAISession(process.env.OPENAI_API_KEY!);
+    results = await oai.expandQuery(query);
+  } else {
+    const llm = getDefaultLlamaCpp();
+    results = await llm.expandQuery(query);
+  }
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
   // Filter out entries that duplicate the original query text.
@@ -2122,10 +2216,17 @@ export async function rerank(query: string, documents: { file: string; text: str
     }
   }
 
-  // Rerank uncached documents using LlamaCpp
+  // Rerank uncached documents
   if (uncachedDocs.length > 0) {
-    const llm = getDefaultLlamaCpp();
-    const rerankResult = await llm.rerank(query, uncachedDocs, { model });
+    let rerankResult;
+    if (useOpenAI()) {
+      const { OpenAISession } = await import("./openai.js");
+      const oai = new OpenAISession(process.env.OPENAI_API_KEY!);
+      rerankResult = await oai.rerank(query, uncachedDocs);
+    } else {
+      const llm = getDefaultLlamaCpp();
+      rerankResult = await llm.rerank(query, uncachedDocs, { model });
+    }
 
     // Cache results — use original doc.text for cache key (result.file lacks chunk text)
     const textByFile = new Map(documents.map(d => [d.file, d.text]));
@@ -2720,7 +2821,7 @@ export async function hybridQuery(
   // Vector searches run sequentially — node-llama-cpp's embed context
   // hangs on concurrent embed() calls (known limitation).
   if (hasVectors) {
-    const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 20, collection);
+    const vecResults = await store.searchVec(query, getActiveEmbedModel(), 20, collection);
     if (vecResults.length > 0) {
       for (const r of vecResults) docidMap.set(r.filepath, r.docid);
       rankedLists.push(vecResults.map(r => ({
@@ -2746,7 +2847,7 @@ export async function hybridQuery(
     } else {
       // vec or hyde → vector search only
       if (hasVectors) {
-        const vecResults = await store.searchVec(q.text, DEFAULT_EMBED_MODEL, 20, collection);
+        const vecResults = await store.searchVec(q.text, getActiveEmbedModel(), 20, collection);
         if (vecResults.length > 0) {
           for (const r of vecResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(vecResults.map(r => ({
@@ -2889,7 +2990,7 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.text)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection);
+    const vecResults = await store.searchVec(q, getActiveEmbedModel(), limit, collection);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {

@@ -4,16 +4,19 @@
  * Provides embeddings, text generation, and reranking using local GGUF models.
  */
 
-import {
-  getLlama,
-  resolveModelFile,
-  LlamaChatSession,
-  LlamaLogLevel,
-  type Llama,
-  type LlamaModel,
-  type LlamaEmbeddingContext,
-  type Token as LlamaToken,
-} from "node-llama-cpp";
+// Lazy import to avoid loading NAPI module when using OpenAI
+type Llama = import("node-llama-cpp").Llama;
+type LlamaModel = import("node-llama-cpp").LlamaModel;
+type LlamaEmbeddingContext = import("node-llama-cpp").LlamaEmbeddingContext;
+type LlamaToken = import("node-llama-cpp").Token;
+
+let _nodeLlamaCpp: typeof import("node-llama-cpp") | null = null;
+async function getNodeLlamaCpp() {
+  if (!_nodeLlamaCpp) {
+    _nodeLlamaCpp = await import("node-llama-cpp");
+  }
+  return _nodeLlamaCpp;
+}
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
@@ -264,6 +267,7 @@ export async function pullModels(
       }
     }
 
+    const { resolveModelFile } = await getNodeLlamaCpp();
     const path = await resolveModelFile(model, cacheDir);
     const sizeBytes = existsSync(path) ? statSync(path).size : 0;
     if (hfRef && filename) {
@@ -491,7 +495,8 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      this.llama = await getLlama({ logLevel: LlamaLogLevel.error });
+      const nlc = await getNodeLlamaCpp();
+      this.llama = await nlc.getLlama({ logLevel: nlc.LlamaLogLevel.error });
     }
     return this.llama;
   }
@@ -502,6 +507,7 @@ export class LlamaCpp implements LLM {
   private async resolveModel(modelUri: string): Promise<string> {
     this.ensureModelCacheDir();
     // resolveModelFile handles HF URIs and downloads to the cache dir
+    const { resolveModelFile } = await getNodeLlamaCpp();
     return await resolveModelFile(modelUri, this.modelCacheDir);
   }
 
@@ -737,6 +743,7 @@ export class LlamaCpp implements LLM {
     await this.ensureGenerateModel();
 
     // Create fresh context -> sequence -> session for each call
+    const { LlamaChatSession } = await getNodeLlamaCpp();
     const context = await this.generateModel!.createContext();
     const sequence = context.getSequence();
     const session = new LlamaChatSession({ contextSequence: sequence });
@@ -810,9 +817,10 @@ export class LlamaCpp implements LLM {
     const prompt = `/no_think Expand this search query: ${query}`;
 
     // Create fresh context for each call
+    const { LlamaChatSession: ChatSession } = await getNodeLlamaCpp();
     const genContext = await this.generateModel!.createContext();
     const sequence = genContext.getSequence();
-    const session = new LlamaChatSession({ contextSequence: sequence });
+    const session = new ChatSession({ contextSequence: sequence });
 
     try {
       // Qwen3 recommended settings for non-thinking mode:
@@ -1154,6 +1162,17 @@ export async function withLLMSession<T>(
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
+  // Use OpenAI when API key is available — avoids node-llama-cpp NAPI crashes
+  if (useOpenAI()) {
+    const { OpenAISession } = await import("./openai.js");
+    const session = new OpenAISession(process.env.OPENAI_API_KEY!);
+    try {
+      return await fn(session);
+    } finally {
+      session.release();
+    }
+  }
+
   const manager = getSessionManager();
   const session = new LLMSession(manager, options);
 
@@ -1162,6 +1181,13 @@ export async function withLLMSession<T>(
   } finally {
     session.release();
   }
+}
+
+/**
+ * Check if OpenAI API should be used instead of local node-llama-cpp.
+ */
+export function useOpenAI(): boolean {
+  return !!(process.env.OPENAI_API_KEY);
 }
 
 /**
